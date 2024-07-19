@@ -3,32 +3,34 @@ import time
 import binascii
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QGridLayout, QWidget, QPushButton, 
                              QLabel, QComboBox, QVBoxLayout, QHBoxLayout, QMessageBox, 
-                             QTextEdit, QScrollArea, QSlider)
+                             QTextEdit, QScrollArea, QSlider, QLineEdit)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-import serial
-import serial.tools.list_ports
+from pyftdi.ftdi import Ftdi
+from pyftdi.serialext import serial_for_url
 
 MINER_CONFIGS = {
     'Antminer S17': {'chips': 45, 'has_pic': True},
     'Antminer S19k Pro': {'chips': 126, 'has_pic': False},
-    # Add other models as needed
 }
 
 class BitcraneThread(QThread):
     update_signal = pyqtSignal(int, bool)
     log_signal = pyqtSignal(str)
 
-    def __init__(self, parent, port, model):
+    def __init__(self, parent, device_url, model, baud_rate, timeout, ping_command):
         super().__init__(parent)
-        self.port = port
+        self.device_url = device_url
         self.model = model
+        self.baud_rate = baud_rate
+        self.timeout = timeout
+        self.ping_command = ping_command
         self.is_running = True
-        self.serial_port = None
+        self.port = None
 
     def run(self):
         try:
             self.initialize_bitcrane()
-            self.log_signal.emit(f"Connected to Bitcrane on {self.port}")
+            self.log_signal.emit(f"Connected to Bitcrane on {self.device_url}")
             
             if not self.ping_bitcrane():
                 self.log_signal.emit("Failed to ping Bitcrane. Check connections.")
@@ -55,47 +57,52 @@ class BitcraneThread(QThread):
 
     def initialize_bitcrane(self):
         try:
-            self.serial_port = serial.Serial(self.port, baudrate=115200, timeout=1)
-            self.log_signal.emit(f"Connected to {self.port}")
+            self.port = serial_for_url(self.device_url, baudrate=self.baud_rate, timeout=self.timeout)
+            self.log_signal.emit(f"Connected to {self.device_url} at {self.baud_rate} baud")
         except Exception as e:
             self.log_signal.emit(f"Initialization error: {str(e)}")
             raise
 
     def cleanup(self):
-        if self.serial_port:
-            self.serial_port.close()
+        if self.port:
+            self.port.close()
 
     def stop(self):
         self.is_running = False
 
     def ping_bitcrane(self):
-        command = bytes([0x55, 0xAA, 0x51, 0x09, 0x00, 0xA4, 0x90, 0x00, 0xFF, 0xFF, 0x1C])
+        try:
+            command = bytes.fromhex(self.ping_command.replace(' ', ''))
+        except ValueError:
+            self.log_signal.emit("Invalid ping command format")
+            return False
+        
         self.log_signal.emit(f"Sending ping: {binascii.hexlify(command)}")
-        self.serial_port.write(command)
-        response = self.serial_port.read(11)
+        self.port.write(command)
+        response = self.port.read(100)  # Read up to 100 bytes
         self.log_signal.emit(f"Ping response: {binascii.hexlify(response)}")
         return len(response) > 0
 
     def power_on_hashboard(self):
         command = bytes([0x55, 0xAA, 0x52, 0x05, 0x00, 0x00, 0x0A])
         self.log_signal.emit(f"Sending power-on command: {binascii.hexlify(command)}")
-        self.serial_port.write(command)
-        response = self.serial_port.read(7)
+        self.port.write(command)
+        response = self.port.read(7)
         self.log_signal.emit(f"Power-on response: {binascii.hexlify(response)}")
 
     def detect_chip(self, chip_index):
         command = self.create_read_command(chip_index)
         self.log_signal.emit(f"Sending chip detect command: {binascii.hexlify(command)}")
-        self.serial_port.write(command)
-        response = self.serial_port.read(9)  # Assuming 9-byte response
+        self.port.write(command)
+        response = self.port.read(9)  # Assuming 9-byte response
         self.log_signal.emit(f"Chip detect response: {binascii.hexlify(response)}")
         return self.parse_response(response)
 
     def read_temperature(self, chip_index):
         command = self.create_temp_command(chip_index)
         self.log_signal.emit(f"Sending temp read command: {binascii.hexlify(command)}")
-        self.serial_port.write(command)
-        response = self.serial_port.read(9)  # Assuming 9-byte response
+        self.port.write(command)
+        response = self.port.read(9)  # Assuming 9-byte response
         self.log_signal.emit(f"Temp read response: {binascii.hexlify(response)}")
         return self.parse_temp_response(response)
 
@@ -116,8 +123,8 @@ class BitcraneThread(QThread):
     def set_fan_speed(self, speed):
         command = bytes([0x55, 0xAA, 0x03, 0x00, speed, 0x00, 0x00, 0x00])
         self.log_signal.emit(f"Sending fan speed command: {binascii.hexlify(command)}")
-        self.serial_port.write(command)
-        response = self.serial_port.read(8)
+        self.port.write(command)
+        response = self.port.read(8)
         self.log_signal.emit(f"Fan speed response: {binascii.hexlify(response)}")
 
 class BitcraneTester(QMainWindow):
@@ -143,12 +150,37 @@ class BitcraneTester(QMainWindow):
         self.model_combo.currentTextChanged.connect(self.update_layout)
         selection_layout.addWidget(self.model_combo)
 
-        selection_layout.addWidget(QLabel("Bitcrane Port:"))
-        self.port_combo = QComboBox()
-        self.update_port_list()
-        selection_layout.addWidget(self.port_combo)
+        selection_layout.addWidget(QLabel("Bitcrane Device:"))
+        self.device_combo = QComboBox()
+        self.update_device_list()
+        selection_layout.addWidget(self.device_combo)
 
         main_layout.addLayout(selection_layout)
+
+        # Add baud rate selection
+        baud_layout = QHBoxLayout()
+        baud_layout.addWidget(QLabel("Baud Rate:"))
+        self.baud_combo = QComboBox()
+        self.baud_combo.addItems(['9600', '19200', '38400', '57600', '115200'])
+        self.baud_combo.setCurrentText('115200')
+        baud_layout.addWidget(self.baud_combo)
+        main_layout.addLayout(baud_layout)
+
+        # Add timeout input
+        timeout_layout = QHBoxLayout()
+        timeout_layout.addWidget(QLabel("Timeout (s):"))
+        self.timeout_input = QLineEdit()
+        self.timeout_input.setText("1")
+        timeout_layout.addWidget(self.timeout_input)
+        main_layout.addLayout(timeout_layout)
+
+        # Add custom ping command input
+        ping_layout = QHBoxLayout()
+        ping_layout.addWidget(QLabel("Ping Command (hex):"))
+        self.ping_input = QLineEdit()
+        self.ping_input.setText("55 AA 51 09 00 A4 90 00 FF FF 1C")
+        ping_layout.addWidget(self.ping_input)
+        main_layout.addLayout(ping_layout)
 
         # Fan speed control
         fan_layout = QHBoxLayout()
@@ -188,13 +220,14 @@ class BitcraneTester(QMainWindow):
 
         self.update_layout(self.model_combo.currentText())
 
-    def update_port_list(self):
-        self.port_combo.clear()
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
-            self.port_combo.addItem(port.device)
-        if self.port_combo.count() == 0:
-            self.port_combo.addItem("No COM ports found")
+    def update_device_list(self):
+        self.device_combo.clear()
+        devices = Ftdi.list_devices()
+        for device in devices:
+            url = f"ftdi://::{device[0].bus:03x}:{device[0].address:03x}/1"
+            self.device_combo.addItem(url)
+        if self.device_combo.count() == 0:
+            self.device_combo.addItem("No FTDI devices found")
 
     def update_layout(self, model):
         # Clear existing layout
@@ -214,10 +247,13 @@ class BitcraneTester(QMainWindow):
             return
 
         model = self.model_combo.currentText()
-        port = self.port_combo.currentText()
+        device_url = self.device_combo.currentText()
+        baud_rate = int(self.baud_combo.currentText())
+        timeout = float(self.timeout_input.text())
+        ping_command = self.ping_input.text()
 
-        if port == "No COM ports found":
-            QMessageBox.warning(self, "Error", "No valid COM port selected.")
+        if device_url == "No FTDI devices found":
+            QMessageBox.warning(self, "Error", "No valid FTDI device selected.")
             return
 
         # Reset all buttons to default state
@@ -225,9 +261,11 @@ class BitcraneTester(QMainWindow):
             button.setStyleSheet("background-color: grey")
 
         self.log_text.clear()
-        self.log_text.append(f"Starting test for {model} on port {port}")
+        self.log_text.append(f"Starting test for {model} on device {device_url}")
+        self.log_text.append(f"Baud rate: {baud_rate}, Timeout: {timeout}s")
+        self.log_text.append(f"Ping command: {ping_command}")
 
-        self.test_thread = BitcraneThread(self, port, model)
+        self.test_thread = BitcraneThread(self, device_url, model, baud_rate, timeout, ping_command)
         self.test_thread.update_signal.connect(self.update_chip_status)
         self.test_thread.log_signal.connect(self.log_message)
         self.test_thread.finished.connect(self.test_finished)
